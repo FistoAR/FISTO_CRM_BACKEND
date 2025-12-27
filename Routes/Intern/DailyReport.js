@@ -182,23 +182,82 @@ router.post("/submit", async (req, res) => {
 });
 
 // GET endpoint - Fetch all daily reports for an employee
+// router.get("/reports/:employee_id", async (req, res) => {
+//   const { employee_id } = req.params;
+//   const { start_date, end_date, limit = 50 } = req.query;
+
+//   try {
+//     let query = `
+//       SELECT * FROM intern_dailyreport 
+//       WHERE employee_id = ?
+//     `;
+//     const params = [employee_id];
+
+//     if (start_date && end_date) {
+//       query += ` AND report_date BETWEEN ? AND ?`;
+//       params.push(start_date, end_date);
+//     }
+
+//     query += ` ORDER BY report_date DESC LIMIT ?`;
+//     params.push(parseInt(limit));
+
+//     const [reports] = await promisePool.query(query, params);
+
+//     res.json({
+//       success: true,
+//       count: reports.length,
+//       reports: reports,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching daily reports:", error);
+//     res.status(500).json({
+//       success: false,
+//       error: "Failed to fetch daily reports",
+//       details: error.message,
+//     });
+//   }
+// });
+
 router.get("/reports/:employee_id", async (req, res) => {
   const { employee_id } = req.params;
   const { start_date, end_date, limit = 50 } = req.query;
 
   try {
     let query = `
-      SELECT * FROM intern_dailyreport 
-      WHERE employee_id = ?
+      SELECT
+        COALESCE(idr.id, '-') AS report_id,
+        att.employee_id,
+        att.login_date AS report_date,
+        att.total_hours AS hours,
+        att.morning_in,
+        att.morning_out,
+        att.afternoon_in,
+        att.afternoon_out,
+
+        COALESCE(idr.employee_name, '-') AS employee_name,
+        COALESCE(idr.project_name, '-') AS project_name,
+        COALESCE(idr.work_done, '-') AS work_done,
+        COALESCE(idr.section, '-') AS section,
+        COALESCE(idr.created_at, '-') AS created_at,
+        COALESCE(idr.updated_at, '-') AS updated_at
+      FROM attendance att
+      LEFT JOIN intern_dailyreport idr
+        ON idr.employee_id = att.employee_id
+        AND idr.report_date = att.login_date
+      WHERE att.employee_id = ?
     `;
+
     const params = [employee_id];
 
     if (start_date && end_date) {
-      query += ` AND report_date BETWEEN ? AND ?`;
+      query += ` AND att.login_date BETWEEN ? AND ?`;
       params.push(start_date, end_date);
     }
 
-    query += ` ORDER BY report_date DESC LIMIT ?`;
+    query += `
+      ORDER BY att.login_date DESC, idr.created_at DESC
+      LIMIT ?
+    `;
     params.push(parseInt(limit));
 
     const [reports] = await promisePool.query(query, params);
@@ -206,7 +265,7 @@ router.get("/reports/:employee_id", async (req, res) => {
     res.json({
       success: true,
       count: reports.length,
-      reports: reports,
+      reports,
     });
   } catch (error) {
     console.error("Error fetching daily reports:", error);
@@ -217,6 +276,7 @@ router.get("/reports/:employee_id", async (req, res) => {
     });
   }
 });
+
 
 // PUT endpoint - Update daily report
 router.put("/update/:report_id", async (req, res) => {

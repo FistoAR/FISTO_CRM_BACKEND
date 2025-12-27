@@ -2,6 +2,15 @@ const express = require("express");
 const router = express.Router();
 const { queryWithRetry } = require("../../dataBase/connection");
 
+// Helper to restrict queries to viewer (creator) or events where viewer is an attendee
+const buildViewerFilter = (viewerId) => {
+  if (!viewerId) return { clause: '', params: [] };
+  return {
+    clause: ' AND (ce.employee_id = ? OR JSON_CONTAINS(ce.attendees, JSON_QUOTE(?), "$"))',
+    params: [viewerId, viewerId],
+  };
+};
+
 // ✅ GET - All employees list for attendee selection
 router.get("/employees", async (req, res) => {
   try {
@@ -33,6 +42,32 @@ router.get("/employees", async (req, res) => {
   }
 });
 
+// ✅ GET - All designations
+router.get("/designations", async (req, res) => {
+  try {
+    const query = `
+      SELECT id, designation
+      FROM designations
+      ORDER BY designation ASC
+    `;
+
+    const rows = await queryWithRetry(query);
+
+    res.json({
+      status: true,
+      count: rows.length,
+      data: rows,
+    });
+  } catch (error) {
+    console.error("Get designations error:", error);
+    res.status(500).json({
+      status: false,
+      message: "Error fetching designations",
+      error: error.message,
+    });
+  }
+});
+
 // ✅ Health check
 router.get("/health", (req, res) => {
   res.json({
@@ -45,16 +80,19 @@ router.get("/health", (req, res) => {
 // ✅ GET - All events with attendee details
 router.get("/", async (req, res) => {
   try {
+    const viewerId = req.get('x-employee-id');
+    const filter = buildViewerFilter(viewerId);
     const query = `
       SELECT 
         ce.*,
         creator.employee_name as creator_name
       FROM calendar_events ce
       LEFT JOIN employees_details creator ON ce.employee_id = creator.employee_id
+      WHERE 1=1 ${filter.clause}
       ORDER BY ce.date ASC, ce.start_time ASC
     `;
 
-    const events = await queryWithRetry(query);
+    const events = await queryWithRetry(query, filter.params);
 
     const formattedEvents = await Promise.all(
       events.map(async (event) => {
@@ -105,6 +143,8 @@ router.get("/range", async (req, res) => {
       });
     }
 
+    const viewerId = req.get('x-employee-id');
+    const filter = buildViewerFilter(viewerId);
     const query = `
       SELECT 
         ce.*,
@@ -115,18 +155,21 @@ router.get("/range", async (req, res) => {
         (ce.date BETWEEN ? AND ?) OR
         (ce.end_date BETWEEN ? AND ?) OR
         (ce.date <= ? AND ce.end_date >= ?)
-      )
+      ) ${filter.clause}
       ORDER BY ce.date ASC, ce.start_time ASC
     `;
 
-    const events = await queryWithRetry(query, [
+    const params = [
       startDate,
       endDate,
       startDate,
       endDate,
       startDate,
       endDate,
-    ]);
+      ...filter.params,
+    ];
+
+    const events = await queryWithRetry(query, params);
 
     const formattedEvents = await Promise.all(
       events.map(async (event) => {
@@ -169,18 +212,20 @@ router.get("/range", async (req, res) => {
 router.get("/date/:date", async (req, res) => {
   try {
     const { date } = req.params;
-
+    const viewerId = req.get('x-employee-id');
+    const filter = buildViewerFilter(viewerId);
     const query = `
       SELECT 
         ce.*,
         creator.employee_name as creator_name
       FROM calendar_events ce
       LEFT JOIN employees_details creator ON ce.employee_id = creator.employee_id
-      WHERE ce.date = ? OR (ce.date <= ? AND ce.end_date >= ?)
+      WHERE (ce.date = ? OR (ce.date <= ? AND ce.end_date >= ?)) ${filter.clause}
       ORDER BY ce.start_time ASC
     `;
 
-    const events = await queryWithRetry(query, [date, date, date]);
+    const params = [date, date, date, ...filter.params];
+    const events = await queryWithRetry(query, params);
 
     const formattedEvents = await Promise.all(
       events.map(async (event) => {
@@ -224,6 +269,7 @@ router.get("/employee/:employeeId", async (req, res) => {
   try {
     const { employeeId } = req.params;
 
+    // This route returns events for a specific employee (creator or attendee)
     const query = `
       SELECT 
         ce.*,
@@ -278,18 +324,20 @@ router.get("/employee/:employeeId", async (req, res) => {
 router.get("/type/:eventtype", async (req, res) => {
   try {
     const { eventtype } = req.params;
-
+    const viewerId = req.get('x-employee-id');
+    const filter = buildViewerFilter(viewerId);
     const query = `
       SELECT 
         ce.*,
         creator.employee_name as creator_name
       FROM calendar_events ce
       LEFT JOIN employees_details creator ON ce.employee_id = creator.employee_id
-      WHERE ce.event_type = ?
+      WHERE ce.event_type = ? ${filter.clause}
       ORDER BY ce.date ASC, ce.start_time ASC
     `;
 
-    const events = await queryWithRetry(query, [eventtype]);
+    const params = [eventtype, ...filter.params];
+    const events = await queryWithRetry(query, params);
 
     const formattedEvents = await Promise.all(
       events.map(async (event) => {
@@ -346,7 +394,22 @@ router.post("/", async (req, res) => {
       attendees,
       formType,
       employeeID,
+      priority,
+      subtype,
+      mode,
+      audience,
+      eventStatus,
+      remarks,
     } = req.body;
+
+    // Accept either camelCase or snake_case inputs for start/end times.
+    // Normalize to `null` when missing/empty so DB stores NULL instead of empty string.
+    const rawStart = startTime ?? req.body.start_time ?? null;
+    const rawEnd = endTime ?? req.body.end_time ?? null;
+    const dbStartTime = rawStart !== null && rawStart !== "" ? String(rawStart) : null;
+    const dbEndTime = rawEnd !== null && rawEnd !== "" ? String(rawEnd) : null;
+
+    console.log('Create event received payload (start/end):', { startTime, endTime, start_time: req.body.start_time, end_time: req.body.end_time });
 
     if (!title || !eventtype || !date || !formType || !employeeID) {
       return res.status(400).json({
@@ -388,16 +451,16 @@ router.post("/", async (req, res) => {
     const insertEventQuery = `
       INSERT INTO calendar_events 
       (employee_id, title, event_type, start_time, end_time, date, end_date, 
-       agenda, link, day, form_type, attendees)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       agenda, link, day, form_type, attendees, priority, subtype, mode, audience, event_status, remarks)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     const result = await queryWithRetry(insertEventQuery, [
       employeeID,
       title,
       eventtype,
-      startTime || "",
-      endTime || "",
+      dbStartTime,
+      dbEndTime,
       date,
       endDate || date,
       agenda || "",
@@ -405,6 +468,12 @@ router.post("/", async (req, res) => {
       day || "workingday",
       formType,
       JSON.stringify(validatedAttendees),
+      priority || null,
+      subtype || null,
+      mode || null,
+      audience || null,
+      eventStatus || null,
+      remarks || null,
     ]);
 
     const eventId = result.insertId;
@@ -420,6 +489,7 @@ router.post("/", async (req, res) => {
 
     const createdEvents = await queryWithRetry(getEventQuery, [eventId]);
     const createdEvent = createdEvents[0];
+    console.log('Created event from DB (start_time,end_time):', createdEvent.start_time, createdEvent.end_time);
 
     let attendeeDetails = [];
     if (validatedAttendees.length > 0) {
@@ -479,6 +549,12 @@ router.put("/:id", async (req, res) => {
       "day",
       "attendees",
       "formType",
+      "priority",
+      "subtype",
+      "mode",
+      "eventStatus",
+      "remarks",
+      "audience",
     ];
 
     const updateFields = [];
@@ -510,10 +586,16 @@ router.put("/:id", async (req, res) => {
             field === "startTime" ? "start_time" :
             field === "endTime" ? "end_time" :
             field === "endDate" ? "end_date" :
-            field === "formType" ? "form_type" : field;
+            field === "formType" ? "form_type" :
+            field === "eventStatus" ? "event_status" : field;
           
           updateFields.push(`${dbField} = ?`);
-          updateValues.push(req.body[field]);
+          // Convert empty strings for time fields to NULL so DB stores NULL
+          let val = req.body[field];
+          if ((field === "startTime" || field === "endTime") && (val === "" || val === null)) {
+            val = null;
+          }
+          updateValues.push(val);
         }
       }
     }

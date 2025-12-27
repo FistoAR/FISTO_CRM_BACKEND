@@ -40,6 +40,7 @@ const projectBudgetRoute = require('./Routes/Management/ProjectBudget');
 const companyBudgetRoutes = require("./Routes/Management/CompanyBudget");
 const calendarRoute = require('./Routes/Calendar/calendar');
 const dailyReportRoute = require('./Routes/Intern/DailyReport');
+const internReportsRoute  = require('./Routes/ProjectHead/InternReports');
 
 
 
@@ -63,9 +64,7 @@ app.use("/api/budget", projectBudgetRoute);
 app.use("/api/company-budget", companyBudgetRoutes);
 app.use("/api/calendar", calendarRoute);
 app.use("/api/daily-report", dailyReportRoute);
-
-
-
+app.use("/api/intern-reports", internReportsRoute);
 
 
 

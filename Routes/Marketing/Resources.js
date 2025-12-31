@@ -115,65 +115,12 @@ router.get("/", async (req, res) => {
   }
 });
 
-// GET - Fetch single resource by ID
-router.get("/:id", async (req, res) => {
-  let connection;
-  try {
-    const { id } = req.params;
-
-    connection = await getConnectionWithRetry();
-
-    const [rows] = await new Promise((resolve, reject) => {
-      connection.query(
-        "SELECT * FROM marketing_resources WHERE id = ?",
-        [id],
-        (err, results) => {
-          if (err) reject(err);
-          else resolve([results]);
-        }
-      );
-    });
-
-    if (rows.length === 0) {
-      return res.status(404).json({
-        status: false,
-        message: "Resource not found",
-      });
-    }
-
-    const row = rows[0];
-    const employeeName = await getEmployeeName(connection, row.employee_id);
-    const lastUpdatedByName = await getEmployeeName(connection, row.last_updated_by);
-
-    const resource = {
-      ...row,
-      date: formatDate(row.created_at),
-      employee_name: employeeName,
-      last_updated_by_name: lastUpdatedByName
-    };
-
-    res.json({
-      status: true,
-      message: "Resource fetched successfully",
-      data: resource,
-    });
-  } catch (error) {
-    console.error("Error fetching resource:", error);
-    res.status(500).json({
-      status: false,
-      message: "Failed to fetch resource",
-      error: error.message,
-    });
-  } finally {
-    if (connection) connection.release();
-  }
-});
-
 // POST - Create new resource
 router.post("/", async (req, res) => {
   let connection;
   try {
     const {
+      resource_category,
       link_name,
       link_description,
       link,
@@ -182,10 +129,17 @@ router.post("/", async (req, res) => {
     } = req.body;
 
     // Validation
-    if (!link_name || !link || !category || !employee_id) {
+    if (!resource_category || !link_name || !link || !category || !employee_id) {
       return res.status(400).json({
         status: false,
-        message: "Missing required fields: link_name, link, category, employee_id",
+        message: "Missing required fields: resource_category, link_name, link, category, employee_id",
+      });
+    }
+
+    if (!["SEO", "SMM", "CM", "Others"].includes(resource_category)) {
+      return res.status(400).json({
+        status: false,
+        message: 'Resource category must be one of: SEO, SMM, CM, Others',
       });
     }
 
@@ -200,14 +154,15 @@ router.post("/", async (req, res) => {
 
     const query = `
       INSERT INTO marketing_resources 
-      (link_name, link_description, link, category, employee_id, last_updated_by)
-      VALUES (?, ?, ?, ?, ?, ?)
+      (resource_category, link_name, link_description, link, category, employee_id, last_updated_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `;
 
     const result = await new Promise((resolve, reject) => {
       connection.query(
         query,
         [
+          resource_category,
           link_name,
           link_description || null,
           link,
@@ -267,7 +222,7 @@ router.put("/:id", async (req, res) => {
   let connection;
   try {
     const { id } = req.params;
-    const { link_name, link_description, link, category, employee_id } = req.body;
+    const { resource_category, link_name, link_description, link, category, employee_id } = req.body;
 
     connection = await getConnectionWithRetry();
 
@@ -298,6 +253,13 @@ router.put("/:id", async (req, res) => {
       });
     }
 
+    if (resource_category && !["SEO", "SMM", "CM", "Others"].includes(resource_category)) {
+      return res.status(400).json({
+        status: false,
+        message: 'Resource category must be one of: SEO, SMM, CM, Others',
+      });
+    }
+
     if (category && !["important", "rough"].includes(category)) {
       return res.status(400).json({
         status: false,
@@ -307,7 +269,8 @@ router.put("/:id", async (req, res) => {
 
     const query = `
       UPDATE marketing_resources 
-      SET link_name = ?, 
+      SET resource_category = COALESCE(?, resource_category),
+          link_name = ?, 
           link_description = ?, 
           link = ?,
           category = COALESCE(?, category),
@@ -319,6 +282,7 @@ router.put("/:id", async (req, res) => {
       connection.query(
         query,
         [
+          resource_category || null,
           link_name,
           link_description || null,
           link,

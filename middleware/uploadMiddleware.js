@@ -22,6 +22,9 @@ const storage = multer.diskStorage({
       case 'resume':
         uploadPath = path.join(__dirname, '../Images/resumes');
         break;
+      case 'offerLetter':
+        uploadPath = path.join(__dirname, '../Images/offer_letters');
+        break;
       case 'aadhar':
       case 'panCard':
       case 'voterId':
@@ -33,6 +36,11 @@ const storage = multer.diskStorage({
       case 'degree':
       case 'probation':
         uploadPath = path.join(__dirname, '../Images/certificates');
+        break;
+      case 'paySlip':
+      case 'experienceLetter':
+      case 'relievingLetter':
+        uploadPath = path.join(__dirname, '../Images/exit_docs');
         break;
       default:
         uploadPath = path.join(__dirname, '../Images/others');
@@ -48,7 +56,7 @@ const storage = multer.diskStorage({
     const ext = path.extname(file.originalname);
     const filename = `${timestamp}-${randomNumber}${ext}`;
     
-    console.log(`Saving file as: ${filename}`);
+    console.log(`Saving file as: ${filename} in field: ${file.fieldname}`);
     cb(null, filename);
   },
 });
@@ -84,6 +92,7 @@ const upload = multer({
 const uploadFields = upload.fields([
   { name: 'profile', maxCount: 1 },
   { name: 'resume', maxCount: 1 },
+  { name: 'offerLetter', maxCount: 1 },
   { name: 'aadhar', maxCount: 1 },
   { name: 'panCard', maxCount: 1 },
   { name: 'voterId', maxCount: 1 },
@@ -92,6 +101,9 @@ const uploadFields = upload.fields([
   { name: 'twelfth', maxCount: 1 },
   { name: 'degree', maxCount: 1 },
   { name: 'probation', maxCount: 1 },
+  { name: 'paySlip', maxCount: 1 },
+  { name: 'experienceLetter', maxCount: 1 },
+  { name: 'relievingLetter', maxCount: 1 },
   { name: 'otherDocs', maxCount: 10 },
 ]);
 

@@ -9,6 +9,58 @@ const {
   getConnectionWithRetry,
 } = require("../../dataBase/connection");
 
+function generateContactPersonId() {
+  return Math.floor(Math.random() * (9999 - 100 + 1)) + 100;
+}
+
+// function generateUniqueContactPersonId(existingContactPersons = []) {
+//   const existingIds = new Set(
+//     existingContactPersons.map(person => person.id).filter(id => id != null)
+//   );
+  
+//   let newId;
+//   let attempts = 0;
+//   const maxAttempts = 100;
+  
+//   do {
+//     newId = generateContactPersonId();
+//     attempts++;
+    
+//     if (attempts > maxAttempts) {
+//       throw new Error("Unable to generate unique contact person ID");
+//     }
+//   } while (existingIds.has(newId));
+  
+//   return newId;
+// }
+
+function ensureContactPersonIds(contactPersons) {
+  if (!Array.isArray(contactPersons)) {
+    return [];
+  }
+  
+  const existingIds = new Set();
+  
+  return contactPersons.map(person => {
+    if (person.id && !existingIds.has(person.id)) {
+      existingIds.add(person.id);
+      return person;
+    }
+    
+    let newId;
+    do {
+      newId = generateContactPersonId();
+    } while (existingIds.has(newId));
+    
+    existingIds.add(newId);
+    
+    return {
+      ...person,
+      id: newId
+    };
+  });
+}
+
 const upload = multer({
   dest: "uploads/",
   fileFilter: (req, file, cb) => {
@@ -43,21 +95,67 @@ router.post("/", async (req, res) => {
       connection.beginTransaction((err) => (err ? reject(err) : resolve()));
     });
 
-    let clientId;
+    const validContacts = contactPersons?.filter(cp => cp.name?.trim()) || [];
+    
+    let contactPersonsWithIds;
+    
+    if (clientData.id) {
+      const existingClient = await queryWithRetry(
+        "SELECT contactPersons FROM ClientsDataManagement WHERE id = ?",
+        [clientData.id]
+      );
+      
+      let existingContacts = [];
+      if (existingClient.length > 0 && existingClient[0].contactPersons) {
+        try {
+          existingContacts = typeof existingClient[0].contactPersons === 'string'
+            ? JSON.parse(existingClient[0].contactPersons)
+            : existingClient[0].contactPersons;
+        } catch (err) {
+          console.error("Error parsing existing contacts:", err);
+        }
+      }
+      
+      const allExistingIds = new Set(existingContacts.map(c => c.id).filter(id => id != null));
+      
+      contactPersonsWithIds = validContacts.map(contact => {
+        if (contact.id && allExistingIds.has(contact.id)) {
+          return { ...contact, id: contact.id };
+        }
+        
+        let newId;
+        do {
+          newId = generateContactPersonId();
+        } while (allExistingIds.has(newId));
+        
+        allExistingIds.add(newId);
+        
+        return {
+          ...contact,
+          id: newId
+        };
+      });
+    } else {
+      contactPersonsWithIds = ensureContactPersonIds(validContacts);
+    }
+    
+    const contactPersonsJSON = JSON.stringify(contactPersonsWithIds);
 
     if (clientData.id) {
       await new Promise((resolve, reject) => {
         connection.query(
-          `UPDATE ClientsData 
-           SET company_name=?, customer_name=?, 
-               industry_type=?, website=?, address=?, city=?, state=?, 
-               reference=?, requirements=?, updated_at=CURRENT_TIMESTAMP
+          `UPDATE ClientsDataManagement 
+           SET  company_name=?, customer_name=?, 
+               industry_type=?, website=?, contactPersons=?, address=?, 
+               city=?, state=?, reference=?, requirements=?, 
+               updated_at=CURRENT_TIMESTAMP
            WHERE id=?`,
           [
             clientData.company_name,
             clientData.customer_name,
             clientData.industry_type || null,
             clientData.website || null,
+            contactPersonsJSON,
             clientData.address || null,
             clientData.city || null,
             clientData.state || null,
@@ -69,28 +167,31 @@ router.post("/", async (req, res) => {
         );
       });
 
-      clientId = clientData.id;
-
       await new Promise((resolve, reject) => {
-        connection.query(
-          "DELETE FROM ContactPersons WHERE clientID=?",
-          [clientId],
-          (err) => (err ? reject(err) : resolve())
-        );
+        connection.commit((err) => (err ? reject(err) : resolve()));
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Client updated",
+        clientId: clientData.id,
+        contactPersons: contactPersonsWithIds,
       });
     } else {
       const result = await new Promise((resolve, reject) => {
         connection.query(
-          `INSERT INTO ClientsData 
+          `INSERT INTO ClientsDataManagement 
            (employee_id, company_name, customer_name, industry_type, 
-            website, address, city, state, reference, requirements, active)
-           VALUES (?,?,?,?,?,?,?,?,?,?,1)`,
+            website, contactPersons, address, city, state, reference, 
+            requirements, active)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,1)`,
           [
             clientData.employee_id,
             clientData.company_name,
             clientData.customer_name,
             clientData.industry_type || null,
             clientData.website || null,
+            contactPersonsJSON,
             clientData.address || null,
             clientData.city || null,
             clientData.state || null,
@@ -101,39 +202,17 @@ router.post("/", async (req, res) => {
         );
       });
 
-      clientId = result.insertId;
+      await new Promise((resolve, reject) => {
+        connection.commit((err) => (err ? reject(err) : resolve()));
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Client added",
+        clientId: result.insertId,
+        contactPersons: contactPersonsWithIds,
+      });
     }
-
-    if (contactPersons?.length) {
-      for (const contact of contactPersons) {
-        if (contact.name?.trim()) {
-          await new Promise((resolve, reject) => {
-            connection.query(
-              `INSERT INTO ContactPersons (clientID, name, contactNumber, email, designation)
-             VALUES (?,?,?,?,?)`,
-              [
-                clientId,
-                contact.name,
-                contact.contactNumber,
-                contact.email || null,
-                contact.designation || null,
-              ],
-              (err) => (err ? reject(err) : resolve())
-            );
-          });
-        }
-      }
-    }
-
-    await new Promise((resolve, reject) => {
-      connection.commit((err) => (err ? reject(err) : resolve()));
-    });
-
-    res.status(200).json({
-      success: true,
-      message: clientData.id ? "Client updated" : "Client added",
-      clientId,
-    });
   } catch (error) {
     if (connection) {
       await new Promise((resolve) => {
@@ -162,37 +241,41 @@ router.get("/", async (req, res) => {
     if (active === "true") activeValue = 1;
 
     let query = `
-      SELECT c.*,
-        JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'id', cp.id, 'name', cp.name,
-            'contactNumber', cp.contactNumber,
-            'email', cp.email, 'designation', cp.designation
-          )
-        ) as contactPersons
-      FROM ClientsData c
-      LEFT JOIN ContactPersons cp ON c.id = cp.clientID
-      WHERE c.active = ?
+      SELECT * FROM ClientsDataManagement
+      WHERE active = ?
     `;
 
     const params = [activeValue];
 
     if (employee_id) {
-      query += " AND c.employee_id = ?";
+      query += " AND employee_id = ?";
       params.push(employee_id);
     }
 
-    query += " GROUP BY c.id ORDER BY c.created_at DESC";
+    query += " ORDER BY created_at DESC";
 
     const results = await queryWithRetry(query, params);
 
     if (results.length > 0) {
-      const clients = results.map((client) => ({
-        ...client,
-        contactPersons: JSON.parse(client.contactPersons).filter(
-          (cp) => cp.id !== null
-        ),
-      }));
+      const clients = results.map((client) => {
+        let contactPersons = [];
+        
+        try {
+          contactPersons = typeof client.contactPersons === 'string' 
+            ? JSON.parse(client.contactPersons) 
+            : (client.contactPersons || []);
+          
+          contactPersons = ensureContactPersonIds(contactPersons);
+        } catch (err) {
+          console.error("Error parsing contactPersons:", err);
+          contactPersons = [];
+        }
+
+        return {
+          ...client,
+          contactPersons,
+        };
+      });
 
       res.status(200).json({ success: true, data: clients });
     } else {
@@ -214,7 +297,7 @@ router.get("/:id", async (req, res) => {
     const { id } = req.params;
 
     const clientResults = await queryWithRetry(
-      "SELECT * FROM ClientsData WHERE id=? AND active=1",
+      "SELECT * FROM ClientsDataManagement WHERE id=? AND active=1",
       [id]
     );
 
@@ -223,12 +306,21 @@ router.get("/:id", async (req, res) => {
     }
 
     const client = clientResults[0];
-    const contactResults = await queryWithRetry(
-      "SELECT * FROM ContactPersons WHERE clientID=?",
-      [id]
-    );
+    
+    let contactPersons = [];
+    try {
+      contactPersons = typeof client.contactPersons === 'string'
+        ? JSON.parse(client.contactPersons)
+        : (client.contactPersons || []);
+      
+      contactPersons = ensureContactPersonIds(contactPersons);
+    } catch (err) {
+      console.error("Error parsing contactPersons:", err);
+      contactPersons = [];
+    }
+    
+    client.contactPersons = contactPersons;
 
-    client.contactPersons = contactResults;
     res.status(200).json({ success: true, data: client });
   } catch (err) {
     console.error("Error fetching client:", err);
@@ -240,7 +332,7 @@ router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const result = await queryWithRetry(
-      "UPDATE ClientsData SET active=0 WHERE id=?",
+      "UPDATE ClientsDataManagement SET active=0 WHERE id=?",
       [id]
     );
 
@@ -260,7 +352,7 @@ router.patch("/:id", async (req, res) => {
     const { id } = req.params;
 
     const result = await queryWithRetry(
-      "UPDATE ClientsData SET active = 1 WHERE id = ?",
+      "UPDATE ClientsDataManagement SET active = 1 WHERE id = ?",
       [id]
     );
 
@@ -282,6 +374,11 @@ router.post("/upload", upload.single("file"), async (req, res) => {
     }
 
     const { employee_id } = req.body;
+
+    if (!employee_id) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ message: "Employee ID is required" });
+    }
 
     const filePath = req.file.path;
     const ext = req.file.originalname.split(".").pop().toLowerCase();
@@ -329,22 +426,62 @@ function parseExcel(filePath) {
 }
 
 async function insertClientsData(clientsData, employee_id) {
-
   const results = { inserted: 0, failed: 0, errors: [] };
 
   for (const row of clientsData) {
     try {
-      const clientResult = await queryWithRetry(
-        `INSERT INTO ClientsData 
+      const contactPersons = [];
+      
+      const contactName = row["Contact Person"] || row["contact_person"] || "";
+      const phoneNumberString = String(row["Phone Number"] || row["phone_number"] || "").trim();
+      const contactEmail = row["Mail ID"] || row["email"] || "";
+      const contactDesignation = row["Designation"] || row["designation"] || "";
+
+      // Check if phone numbers are comma-separated
+      if (phoneNumberString && phoneNumberString.includes(",")) {
+        const phoneNumbers = phoneNumberString
+          .split(",")
+          .map((p) => p.trim())
+          .filter((p) => p);
+        
+        const baseContactName = contactName || "Contact Person";
+
+        // Create separate contact person entries for each phone number
+        for (let i = 0; i < phoneNumbers.length; i++) {
+          contactPersons.push({
+            name: `${baseContactName} ${i + 1}`,
+            contactNumber: phoneNumbers[i],
+            email: contactEmail,
+            designation: contactDesignation,
+          });
+        }
+      } else {
+        // Single contact person
+        if (contactName.trim() || phoneNumberString.trim()) {
+          contactPersons.push({
+            name: contactName,
+            contactNumber: phoneNumberString,
+            email: contactEmail,
+            designation: contactDesignation,
+          });
+        }
+      }
+
+      const contactPersonsWithIds = ensureContactPersonIds(contactPersons);
+      const contactPersonsJSON = JSON.stringify(contactPersonsWithIds);
+
+      await queryWithRetry(
+        `INSERT INTO ClientsDataManagement 
          (employee_id, company_name, customer_name, industry_type, 
-          website, address, city, state, reference, requirements)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          website, contactPersons, address, city, state, reference, requirements)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [
           employee_id,
           row["Company name"] || row["company_name"] || "",
           row["Customer Name"] || row["customer_name"] || "",
           row["Industry Type"] || row["industry_type"] || "",
           row["Website"] || row["website"] || "",
+          contactPersonsJSON,
           row["Address"] || row["address"] || "",
           row["City"] || row["city"] || "",
           row["State"] || row["state"] || "",
@@ -352,48 +489,6 @@ async function insertClientsData(clientsData, employee_id) {
           row["Requirements"] || row["requirements"] || "",
         ]
       );
-
-      const clientId = clientResult.insertId;
-
-      const phoneNumberString = String(row["Phone Number"] || "").trim();
-
-      console.log(phoneNumberString)
-
-      if (phoneNumberString && phoneNumberString.includes(",")) {
-        const phoneNumbers = phoneNumberString
-          .split(",")
-          .map((p) => p.trim())
-          .filter((p) => p);
-        const baseContactName = row["Contact Person"] || "Contact Person";
-
-        for (let i = 0; i < phoneNumbers.length; i++) {
-          const contactName = `${baseContactName} ${i + 1}`;
-
-          await queryWithRetry(
-            `INSERT INTO ContactPersons (clientID, name, contactNumber, email, designation)
-       VALUES (?,?,?,?,?)`,
-            [
-              clientId,
-              contactName,
-              phoneNumbers[i],
-              row["Mail ID"] || "",
-              row["Designation"] || "",
-            ]
-          );
-        }
-      } else {
-        await queryWithRetry(
-          `INSERT INTO ContactPersons (clientID, name, contactNumber, email, designation)
-     VALUES (?,?,?,?,?)`,
-          [
-            clientId,
-            row["Contact Person"] || "",
-            phoneNumberString,
-            row["Mail ID"] || "",
-            row["Designation"] || "",
-          ]
-        );
-      }
 
       results.inserted++;
     } catch (error) {

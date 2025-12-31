@@ -1,9 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const {
-  queryWithRetry,
-  getConnectionWithRetry,
-} = require("../../dataBase/connection");
+const { queryWithRetry } = require("../../dataBase/connection");
 
 router.post("/", async (req, res) => {
   const {
@@ -18,6 +15,7 @@ router.post("/", async (req, res) => {
     shareViaEmail = false,
     shareViaWhatsApp = false,
     subTab,
+    following
   } = req.body;
 
   if (!clientID || !status) {
@@ -36,13 +34,12 @@ router.post("/", async (req, res) => {
     const hasAnyField =
       (newContact.name && newContact.name.trim()) ||
       (newContact.contactNumber && newContact.contactNumber.trim());
+
     let contactID = contactPersonID;
 
     if (hasAnyField && subTab === "not_available") {
       const result = await queryWithRetry(
-        `INSERT INTO ContactPersons 
-        (clientID, name, contactNumber, email, designation)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO ContactPersons (clientID, name, contactNumber, email, designation) VALUES (?, ?, ?, ?, ?)`,
         [
           clientID,
           newContact.name || null,
@@ -63,11 +60,8 @@ router.post("/", async (req, res) => {
       sharedStatus = "email";
     }
 
-    // Add employee_id to the INSERT query
     const followupResult = await queryWithRetry(
-      `INSERT INTO Followups 
-      (employee_id, clientID, contactPersonID, status, remarks, nextFollowupDate, shared)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO Followups (employee_id, clientID, contactPersonID, status, remarks, nextFollowupDate, shared, Following) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         employee_id,
         clientID,
@@ -76,6 +70,7 @@ router.post("/", async (req, res) => {
         remarks || null,
         nextFollowup || null,
         sharedStatus,
+        following || 0
       ]
     );
 
@@ -89,11 +84,8 @@ router.post("/", async (req, res) => {
 
     if (hasMeetingData) {
       await queryWithRetry(
-        `INSERT INTO Marketing_meetings 
-        (clientID, followupID, title, date, startTime, endTime, agenda, link, attendees)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO Marketing_meetings ( followupID, title, date, startTime, endTime, agenda, link, attendees) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          clientID,
           followupId,
           meetingData.title,
           meetingData.date,
@@ -125,21 +117,41 @@ router.get("/", async (req, res) => {
       return res.status(400).json({ error: "Status query is required" });
     }
 
+    let followingCondition = "AND f.Following = 0";
+    let statusCondition = "";
+
+    if (status === "returned") {
+      followingCondition = "AND f.Following = 1";
+      statusCondition = "f.status != 'converted' AND f.status != 'droped'";
+    } else if (status === "returnedConverted") {
+      followingCondition = "AND f.Following = 1";
+      statusCondition = "f.status = 'converted'";
+    } else if (status === "returnedDroped") {
+      followingCondition = "AND f.Following = 1";
+      statusCondition = "f.status = 'droped'";
+    } else if (status === "first_followup") {
+      statusCondition = "f.status IN ('first_followup', 'not_reachable')";
+    } else if (status === "converted") {
+      statusCondition = "f.status = 'converted'";
+    } else {
+      statusCondition = "f.status = ?";
+    }
+
     const latestStatusQuery = `
-      SELECT 
-        f.*,
-        c.id as clientID,
-        c.company_name,
-        c.customer_name,
-        c.industry_type,
-        c.website,
-        c.address,
-        c.city,
-        c.state,
-        c.reference,
-        c.requirements,
-        c.created_at AS client_created_at,
-        c.updated_at AS client_updated_at
+      SELECT f.*, 
+        c.id as clientID, 
+        c.company_name, 
+        c.customer_name, 
+        c.industry_type, 
+        c.website, 
+        c.address, 
+        c.city, 
+        c.state, 
+        c.reference, 
+        c.requirements, 
+        c.created_at AS client_created_at, 
+        c.updated_at AS client_updated_at,
+        e.employee_name AS employee_name
       FROM Followups f
       JOIN (
         SELECT clientID, MAX(created_at) AS last_date
@@ -148,53 +160,49 @@ router.get("/", async (req, res) => {
         GROUP BY clientID
       ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
       JOIN ClientsData c ON f.clientID = c.id
-      WHERE ${
-        status === "first_followup"
-          ? "f.status IN ('first_followup', 'not_reachable')"
-          : "f.status = ?"
-      } AND c.active = 1
+      LEFT JOIN employees_details e ON c.employee_id = e.employee_id
+      WHERE ${statusCondition}
+      AND c.active = 1
+      ${followingCondition}
       ${employee_id ? "AND f.employee_id = ?" : ""}
       ORDER BY f.created_at DESC
     `;
 
     let params = [];
-
     if (employee_id) {
       params.push(employee_id);
     }
-
-    if (status !== "first_followup") {
+    if (!["first_followup", "converted", "returned", "returnedConverted", "returnedDroped"].includes(status)) {
       params.push(status);
     }
-
     if (employee_id) {
       params.push(employee_id);
     }
 
     const latestRows = await queryWithRetry(latestStatusQuery, params);
-
     const matchedClientIDs = latestRows.map((r) => r.clientID);
 
     let noFollowupClients = [];
-
     if (status === "first_followup") {
       const noFollowupQuery = `
-        SELECT 
-          c.id AS clientID,
-          c.company_name,
-          c.customer_name,
-          c.industry_type,
-          c.website,
-          c.address,
-          c.city,
-          c.state,
-          c.reference,
-          c.requirements,
-          c.created_at AS client_created_at,
-          c.updated_at AS client_updated_at
+        SELECT c.id AS clientID, 
+          c.company_name, 
+          c.customer_name, 
+          c.industry_type, 
+          c.website, 
+          c.address, 
+          c.city, 
+          c.state, 
+          c.reference, 
+          c.requirements, 
+          c.created_at AS client_created_at, 
+          c.updated_at AS client_updated_at,
+          e.employee_name AS employee_name
         FROM ClientsData c
         LEFT JOIN Followups f ON c.id = f.clientID
-        WHERE f.clientID IS NULL AND c.active = 1
+        LEFT JOIN employees_details e ON c.employee_id = e.employee_id
+        WHERE f.clientID IS NULL 
+        AND c.active = 1
         ${employee_id ? "AND c.employee_id = ?" : ""}
         ORDER BY c.created_at DESC
       `;
@@ -220,7 +228,7 @@ router.get("/", async (req, res) => {
     const placeholders = clientIDs.map(() => "?").join(",");
 
     const contactQuery = `
-      SELECT * FROM ContactPersons
+      SELECT * FROM ContactPersons 
       WHERE clientID IN (${placeholders})
       ORDER BY id ASC
     `;
@@ -233,11 +241,10 @@ router.get("/", async (req, res) => {
     });
 
     const historyQuery = `
-      SELECT 
-        f.*,
-        cp.name AS contact_person_name,
-        cp.contactNumber,
-        cp.email,
+      SELECT f.*, 
+        cp.name AS contact_person_name, 
+        cp.contactNumber, 
+        cp.email, 
         cp.designation
       FROM Followups f
       LEFT JOIN ContactPersons cp ON f.contactPersonID = cp.id
@@ -247,9 +254,8 @@ router.get("/", async (req, res) => {
     const history = await queryWithRetry(historyQuery, clientIDs);
 
     const meetingQuery = `
-      SELECT 
-        m.*,
-        cp.name AS contact_person_name,
+      SELECT m.*, 
+        cp.name AS contact_person_name, 
         f.status AS followup_status
       FROM Marketing_meetings m
       LEFT JOIN Followups f ON m.followupID = f.id
@@ -288,6 +294,8 @@ router.get("/", async (req, res) => {
           contactPersons: contactsGrouped[id] || [],
           nextFollowupDate: latestFollow ? latestFollow.nextFollowupDate : "",
           status: latestFollow ? latestFollow.status : "none",
+          employee_name: clientData.employee_name || null,
+          following: latestFollow?.Following || 0 
         },
         latest_status: latestFollow
           ? {
@@ -296,6 +304,7 @@ router.get("/", async (req, res) => {
               remarks: latestFollow.remarks,
               created_at: latestFollow.created_at,
               followup_date: latestFollow.followup_date,
+              employee_name: latestFollow.employee_name || null,
             }
           : null,
         history: history.filter((h) => h.clientID === id),
@@ -315,16 +324,15 @@ router.get("/client/:clientId", async (req, res) => {
     const { clientId } = req.params;
 
     const results = await queryWithRetry(
-      `SELECT 
-        f.*,
-        cp.name as contact_person_name,
-        cp.contactNumber,
-        cp.email,
+      `SELECT f.*, 
+        cp.name as contact_person_name, 
+        cp.contactNumber, 
+        cp.email, 
         cp.designation
-       FROM Followups f
-       LEFT JOIN ContactPersons cp ON f.contactPersonID = cp.id
-       WHERE f.clientID = ?
-       ORDER BY f.created_at DESC`,
+      FROM Followups f
+      LEFT JOIN ContactPersons cp ON f.contactPersonID = cp.id
+      WHERE f.clientID = ?
+      ORDER BY f.created_at DESC`,
       [clientId]
     );
 
@@ -334,7 +342,6 @@ router.get("/client/:clientId", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch followups" });
   }
 });
-
 
 router.get("/counts", async (req, res) => {
   try {
@@ -348,7 +355,7 @@ router.get("/counts", async (req, res) => {
       SELECT 
         CASE 
           WHEN f.status IN ('first_followup', 'not_reachable') THEN 'first_followup'
-          ELSE f.status 
+          ELSE f.status
         END as status_group,
         COUNT(DISTINCT f.clientID) as count
       FROM Followups f
@@ -359,30 +366,135 @@ router.get("/counts", async (req, res) => {
         GROUP BY clientID
       ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
       JOIN ClientsData c ON f.clientID = c.id
-      WHERE c.active = 1 AND f.employee_id = ?
+      WHERE c.active = 1 
+      AND f.employee_id = ?
+      AND f.Following = 0
       GROUP BY status_group
     `;
 
-    const followupCounts = await queryWithRetry(followupCountsQuery, [employee_id, employee_id]);
+    const followupCounts = await queryWithRetry(followupCountsQuery, [
+      employee_id,
+      employee_id,
+    ]);
 
     const noFollowupQuery = `
       SELECT COUNT(*) as count
       FROM ClientsData c
       LEFT JOIN Followups f ON c.id = f.clientID
-      WHERE f.clientID IS NULL AND c.active = 1 AND c.employee_id = ?
+      WHERE f.clientID IS NULL 
+      AND c.active = 1
+      AND c.employee_id = ?
     `;
-    const noFollowupResult = await queryWithRetry(noFollowupQuery, [employee_id]);
+
+    const noFollowupResult = await queryWithRetry(noFollowupQuery, [
+      employee_id,
+    ]);
     const noFollowupCount = noFollowupResult[0]?.count || 0;
 
     const currentClientsQuery = `
-      SELECT COUNT(*) as count FROM ClientsData WHERE active = 1 AND employee_id = ?
+      SELECT COUNT(*) as count
+      FROM ClientsData
+      WHERE active = 1 AND employee_id = ?
     `;
-    const currentClientsResult = await queryWithRetry(currentClientsQuery, [employee_id]);
+
+    const currentClientsResult = await queryWithRetry(currentClientsQuery, [
+      employee_id,
+    ]);
 
     const deletedClientsQuery = `
-      SELECT COUNT(*) as count FROM ClientsData WHERE active = 0 AND employee_id = ?
+      SELECT COUNT(*) as count
+      FROM ClientsData
+      WHERE active = 0 AND employee_id = ?
     `;
-    const deletedClientsResult = await queryWithRetry(deletedClientsQuery, [employee_id]);
+
+    const deletedClientsResult = await queryWithRetry(deletedClientsQuery, [
+      employee_id,
+    ]);
+
+    const convertedQuery = `
+      SELECT COUNT(DISTINCT f.clientID) as count
+      FROM Followups f
+      JOIN (
+        SELECT clientID, MAX(created_at) AS last_date
+        FROM Followups
+        WHERE employee_id = ?
+        GROUP BY clientID
+      ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
+      JOIN ClientsData c ON f.clientID = c.id
+      WHERE f.status = 'converted'
+      AND c.active = 1
+      AND f.employee_id = ?
+      AND f.Following = 0
+    `;
+
+    const convertedResult = await queryWithRetry(convertedQuery, [
+      employee_id,
+      employee_id,
+    ]);
+
+    const returnedQuery = `
+      SELECT COUNT(DISTINCT f.clientID) as count
+      FROM Followups f
+      JOIN (
+        SELECT clientID, MAX(created_at) AS last_date
+        FROM Followups
+        WHERE employee_id = ?
+        GROUP BY clientID
+      ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
+      JOIN ClientsData c ON f.clientID = c.id
+      WHERE f.status != 'converted'
+      AND f.status != 'droped'
+      AND c.active = 1
+      AND f.employee_id = ?
+      AND f.Following = 1
+    `;
+
+    const returnedResult = await queryWithRetry(returnedQuery, [
+      employee_id,
+      employee_id,
+    ]);
+
+    const returnedConvertedQuery = `
+      SELECT COUNT(DISTINCT f.clientID) as count
+      FROM Followups f
+      JOIN (
+        SELECT clientID, MAX(created_at) AS last_date
+        FROM Followups
+        WHERE employee_id = ?
+        GROUP BY clientID
+      ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
+      JOIN ClientsData c ON f.clientID = c.id
+      WHERE f.status = 'converted'
+      AND c.active = 1
+      AND f.employee_id = ?
+      AND f.Following = 1
+    `;
+
+    const returnedConvertedResult = await queryWithRetry(returnedConvertedQuery, [
+      employee_id,
+      employee_id,
+    ]);
+
+    const returnedDropedQuery = `
+      SELECT COUNT(DISTINCT f.clientID) as count
+      FROM Followups f
+      JOIN (
+        SELECT clientID, MAX(created_at) AS last_date
+        FROM Followups
+        WHERE employee_id = ?
+        GROUP BY clientID
+      ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
+      JOIN ClientsData c ON f.clientID = c.id
+      WHERE f.status = 'droped'
+      AND c.active = 1
+      AND f.employee_id = ?
+      AND f.Following = 1
+    `;
+
+    const returnedDropedResult = await queryWithRetry(returnedDropedQuery, [
+      employee_id,
+      employee_id,
+    ]);
 
     const counts = {
       first_followup: noFollowupCount,
@@ -391,14 +503,17 @@ router.get("/counts", async (req, res) => {
       not_interested: 0,
       not_reachable: 0,
       droped: 0,
-      converted: 0,
-      
+      converted: convertedResult[0]?.count || 0,
+      returned: returnedResult[0]?.count || 0,
+      returnedConverted: returnedConvertedResult[0]?.count || 0,
+      returnedDroped: returnedDropedResult[0]?.count || 0,
       current: currentClientsResult[0]?.count || 0,
       deleted: deletedClientsResult[0]?.count || 0,
     };
+    
 
-    followupCounts.forEach(row => {
-      if (row.status_group === 'first_followup') {
+    followupCounts.forEach((row) => {
+      if (row.status_group === "first_followup") {
         counts.first_followup += row.count;
       } else if (counts.hasOwnProperty(row.status_group)) {
         counts[row.status_group] = row.count;
@@ -415,16 +530,19 @@ router.get("/counts", async (req, res) => {
         GROUP BY clientID
       ) lf ON f.clientID = lf.clientID AND f.created_at = lf.last_date
       JOIN ClientsData c ON f.clientID = c.id
-      WHERE f.status = 'not_reachable' AND c.active = 1 AND f.employee_id = ?
+      WHERE f.status = 'not_reachable'
+      AND c.active = 1
+      AND f.employee_id = ?
+      AND f.Following = 0
     `;
-    const notReachableResult = await queryWithRetry(notReachableQuery, [employee_id, employee_id]);
+
+    const notReachableResult = await queryWithRetry(notReachableQuery, [
+      employee_id,
+      employee_id,
+    ]);
     counts.not_reachable = notReachableResult[0]?.count || 0;
 
-    res.status(200).json({ 
-      success: true, 
-      data: counts 
-    });
-
+    res.status(200).json({ success: true, data: counts });
   } catch (error) {
     console.error("Error fetching followup counts:", error);
     res.status(500).json({ error: "Failed to fetch counts" });

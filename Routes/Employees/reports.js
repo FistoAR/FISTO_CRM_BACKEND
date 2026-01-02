@@ -4,7 +4,7 @@ const { queryWithRetry } = require("../../dataBase/connection");
 
 
 // ===========================
-// GET - Fetch Projects for Employee (Exclude Completed Projects)
+// GET - Fetch Projects for Employee (Include "Other" Projects from Reports)
 // ===========================
 router.get("/employee-projects/:employeeId", async (req, res) => {
   try {
@@ -39,7 +39,7 @@ router.get("/employee-projects/:employeeId", async (req, res) => {
       }
     });
     
-    // Try primary query method
+    // Try primary query method for regular projects
     const query1 = `
       SELECT 
         id,
@@ -100,14 +100,8 @@ router.get("/employee-projects/:employeeId", async (req, res) => {
     // Filter out completed projects
     const activeProjects = projects.filter(p => !completedIds.includes(p.id));
     
-    if (activeProjects.length > 0) {
-      console.log("📋 Active project names:", activeProjects.map(p => p.project_name).join(', '));
-    } else {
-      console.log("⚠️ No active projects found for employee:", employeeId);
-    }
-    
     // Parse employees JSON
-    const parsedProjects = activeProjects.map(project => ({
+    let parsedProjects = activeProjects.map(project => ({
       id: project.id,
       name: project.project_name,
       companyName: project.company_name,
@@ -115,8 +109,57 @@ router.get("/employee-projects/:employeeId", async (req, res) => {
       endDate: project.end_date,
       categories: project.categories,
       description: project.description,
-      employees: JSON.parse(project.employees || '[]')
+      employees: JSON.parse(project.employees || '[]'),
+      source: 'projects_table'
     }));
+    
+    // ===========================
+    // NEW: Fetch "Other" projects from employees_reports
+    // ===========================
+    const otherProjectsQuery = `
+      SELECT 
+        project_id,
+        project_name,
+        DATE_FORMAT(start_date, '%Y-%m-%d') as start_date,
+        DATE_FORMAT(end_date, '%Y-%m-%d') as end_date,
+        latest_status
+      FROM employees_reports
+      WHERE employee_id = ?
+      AND project_id = 0
+      AND latest_status != 'Completed'
+      GROUP BY project_name
+      ORDER BY project_name ASC
+    `;
+    
+    const otherProjects = await queryWithRetry(otherProjectsQuery, [employeeId]);
+    console.log("✅ Found 'Other' projects:", otherProjects.length);
+    
+    // Add "Other" projects to the list with unique IDs
+    const otherParsedProjects = otherProjects.map((project, index) => ({
+      id: `other_${project.project_name.replace(/\s+/g, '_')}`, // Unique ID based on project name
+      name: project.project_name,
+      companyName: 'N/A',
+      startDate: project.start_date,
+      endDate: project.end_date,
+      categories: '',
+      description: '',
+      employees: [],
+      source: 'other',
+      actualProjectId: 0, // This is the real project_id in database
+      projectName: project.project_name // Store original project name
+    }));
+    
+    // Combine both lists
+    parsedProjects = [...parsedProjects, ...otherParsedProjects];
+    
+    // Sort by project name
+    parsedProjects.sort((a, b) => a.name.localeCompare(b.name));
+    
+    if (parsedProjects.length > 0) {
+      console.log("📋 All project names:", parsedProjects.map(p => p.name).join(', '));
+    } else {
+      console.log("⚠️ No active projects found for employee:", employeeId);
+    }
     
     res.status(200).json({
       success: true,
@@ -143,7 +186,7 @@ router.get("/latest-report/:employeeId/:projectId", async (req, res) => {
     console.log("📥 Fetching latest report for:", { employeeId, projectId });
     
     // Handle "Other" project
-    const finalProjectId = (projectId === 'other') ? 0 : projectId;
+    const finalProjectId = (projectId === 'other' || projectId === '0') ? 0 : projectId;
     
     const query = `
       SELECT 
@@ -230,9 +273,9 @@ router.post("/add-task", async (req, res) => {
     const checkQuery = `
       SELECT id, daily_reports 
       FROM employees_reports 
-      WHERE employee_id = ? AND project_id = ?
+      WHERE employee_id = ? AND project_id = ? AND project_name = ?
     `;
-    const existing = await queryWithRetry(checkQuery, [employee_id, finalProjectId]);
+    const existing = await queryWithRetry(checkQuery, [employee_id, finalProjectId, finalProjectName]);
     
     if (existing.length > 0) {
       // Project already exists - just add the daily task
@@ -332,6 +375,7 @@ router.post("/update-task", async (req, res) => {
       employee_id,
       date,
       project_id,
+      project_name,
       progress,
       status,
       today_work
@@ -347,21 +391,34 @@ router.post("/update-task", async (req, res) => {
     }
     
     // Handle "Other" project
-    const finalProjectId = (project_id === 'other') ? 0 : project_id;
+    const finalProjectId = (project_id === 'other' || project_id === '0') ? 0 : project_id;
     
     console.log("💾 Processing task update...");
     console.log("  - Project ID:", finalProjectId);
+    console.log("  - Project Name:", project_name);
     console.log("  - Date:", date);
     console.log("  - Progress:", progress);
     console.log("  - Status:", status);
     
-    // Get existing report
-    const checkQuery = `
-      SELECT id, daily_reports 
-      FROM employees_reports 
-      WHERE employee_id = ? AND project_id = ?
-    `;
-    const existing = await queryWithRetry(checkQuery, [employee_id, finalProjectId]);
+    // Get existing report - for "Other" projects, also match by project_name
+    let checkQuery, params;
+    if (finalProjectId === 0 && project_name) {
+      checkQuery = `
+        SELECT id, daily_reports 
+        FROM employees_reports 
+        WHERE employee_id = ? AND project_id = ? AND project_name = ?
+      `;
+      params = [employee_id, finalProjectId, project_name];
+    } else {
+      checkQuery = `
+        SELECT id, daily_reports 
+        FROM employees_reports 
+        WHERE employee_id = ? AND project_id = ?
+      `;
+      params = [employee_id, finalProjectId];
+    }
+    
+    const existing = await queryWithRetry(checkQuery, params);
     
     if (existing.length === 0) {
       console.log("❌ Project not found");

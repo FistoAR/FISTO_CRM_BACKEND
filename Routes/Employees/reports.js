@@ -2,8 +2,9 @@ const express = require("express");
 const router = express.Router();
 const { queryWithRetry } = require("../../dataBase/connection");
 
+
 // ===========================
-// GET - Fetch Projects for Employee
+// GET - Fetch Projects for Employee (Exclude Completed Projects)
 // ===========================
 router.get("/employee-projects/:employeeId", async (req, res) => {
   try {
@@ -84,14 +85,29 @@ router.get("/employee-projects/:employeeId", async (req, res) => {
       console.log("✅ Method 2 (LIKE) found:", projects.length);
     }
     
-    if (projects.length > 0) {
-      console.log("📋 Project names:", projects.map(p => p.project_name).join(', '));
+    // Get completed project IDs from reports
+    const completedQuery = `
+      SELECT project_id 
+      FROM employees_reports 
+      WHERE employee_id = ? 
+      AND latest_status = 'Completed'
+    `;
+    const completedProjects = await queryWithRetry(completedQuery, [employeeId]);
+    const completedIds = completedProjects.map(p => p.project_id);
+    
+    console.log("🚫 Completed project IDs:", completedIds);
+    
+    // Filter out completed projects
+    const activeProjects = projects.filter(p => !completedIds.includes(p.id));
+    
+    if (activeProjects.length > 0) {
+      console.log("📋 Active project names:", activeProjects.map(p => p.project_name).join(', '));
     } else {
-      console.log("⚠️ No projects found for employee:", employeeId);
+      console.log("⚠️ No active projects found for employee:", employeeId);
     }
     
     // Parse employees JSON
-    const parsedProjects = projects.map(project => ({
+    const parsedProjects = activeProjects.map(project => ({
       id: project.id,
       name: project.project_name,
       companyName: project.company_name,
@@ -116,12 +132,69 @@ router.get("/employee-projects/:employeeId", async (req, res) => {
   }
 });
 
+
 // ===========================
-// POST - Submit Report (Add Task)
+// GET - Fetch Latest Report for Project (for Update Task)
 // ===========================
-router.post("/submit", async (req, res) => {
+router.get("/latest-report/:employeeId/:projectId", async (req, res) => {
   try {
-    console.log("📥 Received report submission:", req.body);
+    const { employeeId, projectId } = req.params;
+    
+    console.log("📥 Fetching latest report for:", { employeeId, projectId });
+    
+    // Handle "Other" project
+    const finalProjectId = (projectId === 'other') ? 0 : projectId;
+    
+    const query = `
+      SELECT 
+        id,
+        daily_reports,
+        latest_status,
+        latest_progress
+      FROM employees_reports
+      WHERE employee_id = ? AND project_id = ?
+      LIMIT 1
+    `;
+    
+    const reports = await queryWithRetry(query, [employeeId, finalProjectId]);
+    
+    if (reports.length > 0) {
+      const dailyReports = JSON.parse(reports[0].daily_reports || '[]');
+      const latestReport = dailyReports[dailyReports.length - 1] || null;
+      
+      console.log("✅ Latest report found:", latestReport);
+      
+      res.status(200).json({
+        success: true,
+        data: latestReport ? {
+          task: latestReport.task,
+          progress: reports[0].latest_progress,
+          status: reports[0].latest_status
+        } : null
+      });
+    } else {
+      console.log("⚠️ No previous report found for this project");
+      res.status(200).json({
+        success: true,
+        data: null
+      });
+    }
+  } catch (error) {
+    console.error("❌ Error fetching latest report:", error);
+    res.status(500).json({ 
+      success: false, 
+      error: "Failed to fetch latest report: " + error.message 
+    });
+  }
+});
+
+
+// ===========================
+// POST - Add Task (Creates New Entry or Adds Daily Task)
+// ===========================
+router.post("/add-task", async (req, res) => {
+  try {
+    console.log("📥 Received add task submission:", req.body);
     
     const {
       employee_id,
@@ -131,213 +204,301 @@ router.post("/submit", async (req, res) => {
       project_name,
       start_date,
       end_date,
-      today_task,
-      progress = 0,
-      status = 'In Progress',
-      today_work = ''
+      today_task
     } = req.body;
     
     // Validation
-    if (!employee_id || !employee_name || !date || !project_id || !today_task) {
+    if (!employee_id || !employee_name || !date || !today_task) {
       console.log("❌ Missing required fields");
-      console.log("  - employee_id:", employee_id);
-      console.log("  - employee_name:", employee_name);
-      console.log("  - date:", date);
-      console.log("  - project_id:", project_id);
-      console.log("  - today_task:", today_task);
-      
       return res.status(400).json({ 
         success: false, 
         error: "Missing required fields" 
       });
     }
     
-    // Prepare JSON data
-    const dateJson = JSON.stringify({
-      date: date,
-      formatted: formatDateToIST(date)
-    });
+    // Handle "Other" project
+    const finalProjectId = (project_id === 'other' || !project_id) ? 0 : project_id;
+    const finalProjectName = project_name || 'Other';
     
-    const taskJson = JSON.stringify({
-      task: today_task,
-      priority: 'Normal'
-    });
-    
-    const workJson = JSON.stringify({
-      work: today_work,
-      hours: 0
-    });
-    
-    console.log("💾 Inserting report into database...");
-    console.log("  - Project:", project_name);
+    console.log("💾 Processing task addition...");
+    console.log("  - Project ID:", finalProjectId);
+    console.log("  - Project Name:", finalProjectName);
     console.log("  - Employee:", employee_name);
     console.log("  - Date:", date);
     
-    // Insert report
-    const insertQuery = `
-      INSERT INTO employees_reports 
-      (employee_id, employee_name, date, project_id, project_name, 
-       start_date, end_date, today_task, progress, status, today_work) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    // Check if project report already exists
+    const checkQuery = `
+      SELECT id, daily_reports 
+      FROM employees_reports 
+      WHERE employee_id = ? AND project_id = ?
     `;
+    const existing = await queryWithRetry(checkQuery, [employee_id, finalProjectId]);
     
-    const result = await queryWithRetry(insertQuery, [
-      employee_id,
-      employee_name,
-      dateJson,
-      project_id,
-      project_name,
-      start_date,
-      end_date,
-      taskJson,
-      progress,
-      status,
-      workJson
-    ]);
-    
-    console.log("✅ Report submitted with ID:", result.insertId);
-    
-    res.status(200).json({
-      success: true,
-      message: "Report submitted successfully",
-      report_id: result.insertId
-    });
+    if (existing.length > 0) {
+      // Project already exists - just add the daily task
+      const dailyReports = JSON.parse(existing[0].daily_reports || '[]');
+      
+      // Check if task for today already exists
+      const todayExists = dailyReports.some(r => r.date === date);
+      if (todayExists) {
+        console.log("⚠️ Task for today already exists");
+        return res.status(400).json({
+          success: false,
+          error: "Task for today already exists. Please use Update Task."
+        });
+      }
+      
+      // Add new daily entry (without work_done for now)
+      dailyReports.push({
+        date: date,
+        task: today_task,
+        progress: 0,
+        status: 'In Progress',
+        work_done: ''
+      });
+      
+      // Update existing record
+      const updateQuery = `
+        UPDATE employees_reports 
+        SET daily_reports = ?
+        WHERE id = ?
+      `;
+      
+      await queryWithRetry(updateQuery, [
+        JSON.stringify(dailyReports),
+        existing[0].id
+      ]);
+      
+      console.log("✅ Task added to existing project");
+      
+      res.status(200).json({
+        success: true,
+        message: "Task added successfully"
+      });
+    } else {
+      // New project - create new record
+      const dailyReports = [{
+        date: date,
+        task: today_task,
+        progress: 0,
+        status: 'In Progress',
+        work_done: ''
+      }];
+      
+      const insertQuery = `
+        INSERT INTO employees_reports 
+        (employee_id, employee_name, project_id, project_name, 
+         start_date, end_date, daily_reports, latest_status, latest_progress) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'In Progress', 0)
+      `;
+      
+      const result = await queryWithRetry(insertQuery, [
+        employee_id,
+        employee_name,
+        finalProjectId,
+        finalProjectName,
+        start_date || null,
+        end_date || null,
+        JSON.stringify(dailyReports)
+      ]);
+      
+      console.log("✅ New project report created with ID:", result.insertId);
+      
+      res.status(200).json({
+        success: true,
+        message: "Task added successfully",
+        report_id: result.insertId
+      });
+    }
   } catch (error) {
-    console.error("❌ Error submitting report:", error);
+    console.error("❌ Error adding task:", error);
     console.error("❌ Error stack:", error.stack);
     res.status(500).json({ 
       success: false, 
-      error: "Failed to submit report: " + error.message 
+      error: "Failed to add task: " + error.message 
     });
   }
 });
 
+
 // ===========================
-// PUT - Update Report
+// POST - Update Task (Update Progress and Add Work Done)
 // ===========================
-router.put("/update/:id", async (req, res) => {
+router.post("/update-task", async (req, res) => {
   try {
-    const { id } = req.params;
-    const { today_task, progress, status, today_work } = req.body;
+    console.log("📥 Received update task submission:", req.body);
     
-    console.log("📥 Updating report ID:", id);
-    console.log("  - Task:", today_task);
-    console.log("  - Progress:", progress);
-    console.log("  - Status:", status);
+    const {
+      employee_id,
+      date,
+      project_id,
+      progress,
+      status,
+      today_work
+    } = req.body;
     
-    // Check if report exists
-    const checkQuery = `SELECT id FROM employees_reports WHERE id = ?`;
-    const existing = await queryWithRetry(checkQuery, [id]);
-    
-    if (existing.length === 0) {
-      console.log("❌ Report not found");
-      return res.status(404).json({ 
+    // Validation
+    if (!employee_id || !date || !project_id || progress === undefined || !today_work) {
+      console.log("❌ Missing required fields");
+      return res.status(400).json({ 
         success: false, 
-        error: "Report not found" 
+        error: "Missing required fields" 
       });
     }
     
-    // Prepare JSON updates
-    const taskJson = JSON.stringify({
-      task: today_task,
-      priority: 'Normal'
-    });
+    // Handle "Other" project
+    const finalProjectId = (project_id === 'other') ? 0 : project_id;
     
-    const workJson = JSON.stringify({
-      work: today_work || '',
-      hours: 0
-    });
+    console.log("💾 Processing task update...");
+    console.log("  - Project ID:", finalProjectId);
+    console.log("  - Date:", date);
+    console.log("  - Progress:", progress);
+    console.log("  - Status:", status);
     
+    // Get existing report
+    const checkQuery = `
+      SELECT id, daily_reports 
+      FROM employees_reports 
+      WHERE employee_id = ? AND project_id = ?
+    `;
+    const existing = await queryWithRetry(checkQuery, [employee_id, finalProjectId]);
+    
+    if (existing.length === 0) {
+      console.log("❌ Project not found");
+      return res.status(404).json({
+        success: false,
+        error: "Project not found. Please add a task first."
+      });
+    }
+    
+    const dailyReports = JSON.parse(existing[0].daily_reports || '[]');
+    
+    // Find today's report
+    const todayIndex = dailyReports.findIndex(r => r.date === date);
+    
+    if (todayIndex === -1) {
+      console.log("❌ No task found for today");
+      return res.status(404).json({
+        success: false,
+        error: "No task found for today. Please add a task first."
+      });
+    }
+    
+    // Update today's report
+    dailyReports[todayIndex].progress = parseInt(progress);
+    dailyReports[todayIndex].status = status;
+    dailyReports[todayIndex].work_done = today_work;
+    
+    // Update database
     const updateQuery = `
       UPDATE employees_reports 
-      SET today_task = ?, 
-          progress = ?, 
-          status = ?,
-          today_work = ?
+      SET daily_reports = ?,
+          latest_status = ?,
+          latest_progress = ?
       WHERE id = ?
     `;
     
-    await queryWithRetry(updateQuery, [taskJson, progress, status, workJson, id]);
+    await queryWithRetry(updateQuery, [
+      JSON.stringify(dailyReports),
+      status,
+      parseInt(progress),
+      existing[0].id
+    ]);
     
-    console.log("✅ Report updated successfully");
+    console.log("✅ Task updated successfully");
     
     res.status(200).json({
       success: true,
-      message: "Report updated successfully"
+      message: "Task updated successfully"
     });
   } catch (error) {
-    console.error("❌ Error updating report:", error);
+    console.error("❌ Error updating task:", error);
+    console.error("❌ Error stack:", error.stack);
     res.status(500).json({ 
       success: false, 
-      error: "Failed to update report: " + error.message 
+      error: "Failed to update task: " + error.message 
     });
   }
 });
 
+
 // ===========================
-// GET - Fetch Reports by Employee (MariaDB Compatible)
+// GET - Fetch All Reports by Employee (Flattened for Display)
 // ===========================
 router.get("/employee-reports/:employeeId", async (req, res) => {
   try {
     const { employeeId } = req.params;
-    const { limit = 100, offset = 0, startDate, endDate } = req.query;
+    const { startDate, endDate } = req.query;
     
     console.log("📥 Fetching reports for employee:", employeeId);
     console.log("📅 Date range:", { startDate, endDate });
-    console.log("📄 Pagination:", { limit, offset });
     
     let query = `
       SELECT 
         id,
         employee_id,
         employee_name,
-        JSON_UNQUOTE(JSON_EXTRACT(date, '$.date')) AS report_date,
-        JSON_UNQUOTE(JSON_EXTRACT(date, '$.formatted')) AS formatted_date,
         project_id,
         project_name,
         DATE_FORMAT(start_date, '%Y-%m-%d') as start_date,
         DATE_FORMAT(end_date, '%Y-%m-%d') as end_date,
-        JSON_UNQUOTE(JSON_EXTRACT(today_task, '$.task')) AS task,
-        JSON_UNQUOTE(JSON_EXTRACT(today_task, '$.priority')) AS priority,
-        progress,
-        status,
-        JSON_UNQUOTE(JSON_EXTRACT(today_work, '$.work')) AS work_done,
-        JSON_UNQUOTE(JSON_EXTRACT(today_work, '$.hours')) AS hours_worked,
+        daily_reports,
+        latest_status,
+        latest_progress,
         DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
         DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at
       FROM employees_reports 
       WHERE employee_id = ?
+      ORDER BY project_name ASC, updated_at DESC
     `;
     
-    const params = [employeeId];
+    const reports = await queryWithRetry(query, [employeeId]);
     
-    if (startDate) {
-      query += ` AND JSON_UNQUOTE(JSON_EXTRACT(date, '$.date')) >= ?`;
-      params.push(startDate);
-    }
+    console.log("✅ Found project reports:", reports.length);
     
-    if (endDate) {
-      query += ` AND JSON_UNQUOTE(JSON_EXTRACT(date, '$.date')) <= ?`;
-      params.push(endDate);
-    }
+    // Parse daily reports and flatten for display
+    const flattenedReports = [];
     
-    query += ` ORDER BY JSON_UNQUOTE(JSON_EXTRACT(date, '$.date')) DESC, created_at DESC LIMIT ? OFFSET ?`;
-    params.push(parseInt(limit), parseInt(offset));
+    reports.forEach(report => {
+      const dailyReports = JSON.parse(report.daily_reports || '[]');
+      
+      dailyReports.forEach(daily => {
+        // Apply date filter if specified
+        if (startDate && daily.date < startDate) return;
+        if (endDate && daily.date > endDate) return;
+        
+        // Only include reports with work_done (means they were updated)
+        if (daily.work_done && daily.work_done.trim() !== '') {
+          flattenedReports.push({
+            id: report.id,
+            project_id: report.project_id,
+            project_name: report.project_name,
+            report_date: daily.date,
+            task: daily.task,
+            progress: daily.progress,
+            status: daily.status,
+            work_done: daily.work_done,
+            start_date: report.start_date,
+            end_date: report.end_date
+          });
+        }
+      });
+    });
     
-    console.log("🔍 Executing query...");
+    console.log("✅ Flattened reports with work done:", flattenedReports.length);
     
-    const reports = await queryWithRetry(query, params);
-    
-    console.log("✅ Found reports:", reports.length);
-    
-    if (reports.length > 0) {
-      console.log("📊 Report dates:", reports.map(r => r.report_date).join(', '));
-    }
+    // Sort by project name and date
+    flattenedReports.sort((a, b) => {
+      if (a.project_name !== b.project_name) {
+        return a.project_name.localeCompare(b.project_name);
+      }
+      return new Date(b.report_date) - new Date(a.report_date);
+    });
     
     res.status(200).json({
       success: true,
-      data: reports,
-      count: reports.length
+      data: flattenedReports,
+      count: flattenedReports.length
     });
   } catch (error) {
     console.error("❌ Error fetching reports:", error);
@@ -348,6 +509,7 @@ router.get("/employee-reports/:employeeId", async (req, res) => {
     });
   }
 });
+
 
 // ===========================
 // GET - Fetch Single Report by ID
@@ -363,18 +525,13 @@ router.get("/report/:id", async (req, res) => {
         id,
         employee_id,
         employee_name,
-        JSON_UNQUOTE(JSON_EXTRACT(date, '$.date')) AS report_date,
-        JSON_UNQUOTE(JSON_EXTRACT(date, '$.formatted')) AS formatted_date,
         project_id,
         project_name,
         DATE_FORMAT(start_date, '%Y-%m-%d') as start_date,
         DATE_FORMAT(end_date, '%Y-%m-%d') as end_date,
-        JSON_UNQUOTE(JSON_EXTRACT(today_task, '$.task')) AS task,
-        JSON_UNQUOTE(JSON_EXTRACT(today_task, '$.priority')) AS priority,
-        progress,
-        status,
-        JSON_UNQUOTE(JSON_EXTRACT(today_work, '$.work')) AS work_done,
-        JSON_UNQUOTE(JSON_EXTRACT(today_work, '$.hours')) AS hours_worked,
+        daily_reports,
+        latest_status,
+        latest_progress,
         DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
         DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s') as updated_at
       FROM employees_reports 
@@ -391,11 +548,15 @@ router.get("/report/:id", async (req, res) => {
       });
     }
     
+    // Parse daily reports
+    const report = reports[0];
+    report.daily_reports = JSON.parse(report.daily_reports || '[]');
+    
     console.log("✅ Report found");
     
     res.status(200).json({
       success: true,
-      data: reports[0]
+      data: report
     });
   } catch (error) {
     console.error("❌ Error fetching report:", error);
@@ -406,8 +567,9 @@ router.get("/report/:id", async (req, res) => {
   }
 });
 
+
 // ===========================
-// DELETE - Delete Report
+// DELETE - Delete Report (Entire Project)
 // ===========================
 router.delete("/delete/:id", async (req, res) => {
   try {
@@ -441,6 +603,7 @@ router.delete("/delete/:id", async (req, res) => {
   }
 });
 
+
 // ===========================
 // GET - Get Report Statistics
 // ===========================
@@ -452,10 +615,10 @@ router.get("/stats/:employeeId", async (req, res) => {
     
     const query = `
       SELECT 
-        COUNT(*) as total_reports,
-        COUNT(CASE WHEN status = 'Completed' THEN 1 END) as completed_reports,
-        COUNT(CASE WHEN status = 'In Progress' THEN 1 END) as in_progress_reports,
-        AVG(progress) as average_progress
+        COUNT(*) as total_projects,
+        COUNT(CASE WHEN latest_status = 'Completed' THEN 1 END) as completed_projects,
+        COUNT(CASE WHEN latest_status = 'In Progress' THEN 1 END) as in_progress_projects,
+        AVG(latest_progress) as average_progress
       FROM employees_reports
       WHERE employee_id = ?
     `;
@@ -477,6 +640,7 @@ router.get("/stats/:employeeId", async (req, res) => {
   }
 });
 
+
 // ===========================
 // Helper Functions
 // ===========================
@@ -489,5 +653,6 @@ function formatDateToIST(dateString) {
     year: "numeric",
   });
 }
+
 
 module.exports = router;
